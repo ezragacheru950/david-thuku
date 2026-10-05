@@ -8,7 +8,7 @@ type UserName = "David" | "Eve";
 
 type Message = {
   id: string;
-  sender: UserName;
+  sender: UserName | "Partner";
   text: string;
   createdAt: string;
 };
@@ -53,50 +53,168 @@ export default function ChatApp() {
   const [selectedUser, setSelectedUser] = useState<UserName>("David");
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [statusText, setStatusText] = useState("Checking your Supabase connection...");
   const [isHydrated, setIsHydrated] = useState(false);
+  const [authState, setAuthState] = useState<"loading" | "demo" | "needs-login" | "signed-in">("loading");
+  const [currentSessionUserId, setCurrentSessionUserId] = useState<string | null>(null);
+
+  const supabase = useMemo(() => getSupabaseClient(), []);
 
   useEffect(() => {
-    setMessages(readStoredMessages());
-    setIsHydrated(true);
-  }, []);
+    const loadInitialState = async () => {
+      if (!supabase) {
+        setMessages(readStoredMessages());
+        setAuthState("demo");
+        setStatusText("Demo mode active: local messages are saved in this browser.");
+        setIsHydrated(true);
+        return;
+      }
+
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+
+        if (session?.user) {
+          setCurrentSessionUserId(session.user.id);
+          setSelectedUser(/david/i.test(session.user.email ?? "") ? "David" : "Eve");
+          setAuthState("signed-in");
+          setStatusText("Connected to Supabase.");
+          await loadMessagesFromSupabase(session.user.id, /david/i.test(session.user.email ?? "") ? "David" : "Eve");
+        } else {
+          setAuthState("needs-login");
+          setStatusText("Login with your David or Eve Supabase account to save messages.");
+          setMessages(readStoredMessages());
+        }
+      } catch {
+        setAuthState("demo");
+        setMessages(readStoredMessages());
+        setStatusText("Supabase is not available; using demo mode instead.");
+      } finally {
+        setIsHydrated(true);
+      }
+    };
+
+    void loadInitialState();
+  }, [supabase]);
+
+  const loadMessagesFromSupabase = async (sessionUserId: string, currentName: UserName) => {
+    if (!supabase) {
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("messages")
+      .select("*")
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      setStatusText("Could not load messages from Supabase.");
+      return;
+    }
+
+    const mappedMessages: Message[] = (data ?? []).map((item) => {
+      const senderId = String(item.sender_id);
+      const text = String(item.content ?? "");
+      const createdAt = String(item.created_at ?? new Date().toISOString());
+      const sender = senderId === sessionUserId ? currentName : currentName === "David" ? "Eve" : "David";
+
+      return {
+        id: String(item.id),
+        sender,
+        text,
+        createdAt,
+      };
+    });
+
+    if (mappedMessages.length > 0) {
+      setMessages(mappedMessages);
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(mappedMessages));
+    }
+  };
 
   useEffect(() => {
     if (!isHydrated || typeof window === "undefined") {
       return;
     }
 
-    const supabase = getSupabaseClient();
+    if (authState === "demo") {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+    }
+  }, [messages, isHydrated, authState]);
 
-    if (supabase) {
-      void (async () => {
-        const { data, error } = await supabase
-          .from("messages")
-          .select("*")
-          .order("created_at", { ascending: true });
+  const isUsingDemoMode = authState === "demo" || !supabase;
 
-        if (!error && data && data.length > 0) {
-          const hydrated = data.map((item) => ({
-            id: String(item.id),
-            sender: item.sender_id === "david" ? "David" : "Eve",
-            text: String(item.content),
-            createdAt: String(item.created_at),
-          }));
-          setMessages(hydrated);
-          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(hydrated));
-        }
-      })();
-
+  const handleSignIn = async () => {
+    if (!supabase) {
+      setAuthState("demo");
+      setStatusText("Supabase is not configured. Demo mode is active.");
       return;
     }
 
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
-  }, [messages, isHydrated]);
+    const trimmedEmail = email.trim();
+    const trimmedPassword = password.trim();
 
-  const isUsingDemoMode = useMemo(() => !getSupabaseClient(), []);
+    if (!trimmedEmail || !trimmedPassword) {
+      setStatusText("Enter both email and password to sign in.");
+      return;
+    }
 
-  const handleSend = () => {
+    setStatusText("Signing you in...");
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: trimmedEmail,
+      password: trimmedPassword,
+    });
+
+    if (error || !data.session?.user) {
+      setStatusText("Unable to sign in. Use a valid Supabase David/Eve account.");
+      setAuthState("needs-login");
+      return;
+    }
+
+    const nextUserName = /david/i.test(trimmedEmail) ? "David" : "Eve";
+    setCurrentSessionUserId(data.session.user.id);
+    setSelectedUser(nextUserName);
+    setAuthState("signed-in");
+    setStatusText(`Signed in as ${nextUserName}.`);
+    await loadMessagesFromSupabase(data.session.user.id, nextUserName);
+    setPassword("");
+  };
+
+  const handleSend = async () => {
     const trimmed = draft.trim();
     if (!trimmed) {
+      return;
+    }
+
+    if (supabase && authState === "signed-in") {
+      const { data, error } = await supabase
+        .from("messages")
+        .insert({
+          sender_id: currentSessionUserId,
+          content: trimmed,
+        })
+        .select()
+        .single();
+
+      if (error || !data) {
+        setStatusText("Your message could not be saved to Supabase. Check your table and RLS policy.");
+        return;
+      }
+
+      const nextMessage: Message = {
+        id: String(data.id),
+        sender: selectedUser,
+        text: String(data.content),
+        createdAt: String(data.created_at ?? new Date().toISOString()),
+      };
+
+      setMessages((current) => [...current, nextMessage]);
+      setDraft("");
+      setStatusText("Message saved to Supabase.");
       return;
     }
 
@@ -109,7 +227,10 @@ export default function ChatApp() {
 
     setMessages((current) => [...current, nextMessage]);
     setDraft("");
+    setStatusText("Message saved locally in demo mode.");
   };
+
+  const signInPanel = authState === "needs-login" || authState === "loading";
 
   return (
     <main className="app-shell">
@@ -118,6 +239,7 @@ export default function ChatApp() {
           <div>
             <h1>Dave and Eve</h1>
           </div>
+
           <div className="user-switcher" aria-label="Select active user">
             {(["David", "Eve"] as const).map((user) => (
               <button
@@ -125,16 +247,42 @@ export default function ChatApp() {
                 type="button"
                 className={`pill ${selectedUser === user ? "active" : ""}`}
                 onClick={() => setSelectedUser(user)}
+                disabled={authState === "signed-in" && supabase !== null}
               >
                 {user}
               </button>
             ))}
           </div>
+
           <span className="status-badge">
             <span className="status-dot" aria-hidden="true" />
             {isUsingDemoMode ? "Demo mode" : "Supabase live"}
           </span>
         </header>
+
+        {signInPanel && supabase && (
+          <div style={{ padding: 18, borderBottom: "1px solid #e5e7eb", background: "#f8fafc" }}>
+            <div style={{ display: "grid", gap: 10 }}>
+              <input
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="david@example.com"
+                style={{ padding: 12, borderRadius: 10, border: "1px solid #d1d5db" }}
+              />
+              <input
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="Password"
+                style={{ padding: 12, borderRadius: 10, border: "1px solid #d1d5db" }}
+              />
+              <button type="button" className="send-button" onClick={handleSignIn}>
+                Sign in to Supabase
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="chat-body">
           <div className="message-list" role="log" aria-live="polite">
@@ -157,19 +305,22 @@ export default function ChatApp() {
             )}
           </div>
 
+          <div style={{ padding: "12px 20px 0", color: "#475467", fontSize: 13 }}>{statusText}</div>
+
           <div className="chat-input">
             <input
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
-                  handleSend();
+                  void handleSend();
                 }
               }}
               placeholder={`Message as ${selectedUser}...`}
               aria-label="Message input"
+              disabled={authState === "needs-login" && !!supabase}
             />
-            <button type="button" className="send-button" onClick={handleSend} disabled={!draft.trim()}>
+            <button type="button" className="send-button" onClick={() => void handleSend()} disabled={!draft.trim() || (authState === "needs-login" && !!supabase)}>
               Send
             </button>
           </div>
